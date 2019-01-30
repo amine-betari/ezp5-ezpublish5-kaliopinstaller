@@ -1,0 +1,982 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PHING build scripts for YYY on eZ Publish 5
+
+  @todo make composer update a standalone task
+  @todo stop workers before deploy, restart them afterwards
+  @todo more surgical cache-clearing: we only need to clear non-clustered caches on all servers, not all caches
+  @todo add task: clear memcache cache
+  @todo add task: clear varnish cache
+  @todo use separate hostnames when doing remote invocations from when getting name of current server, as fqdns might not be in the hosts file
+-->
+<project name="ovumkc" default="help">
+
+    <property name="php" value="php"/>
+
+  <!-- YYY specifics -->
+    <property name="project.vardirname" value="yyy_site" />
+    <!-- used by copy_configs target -->
+    <property name="project.configfiles" value="site,solr,ldap,conversion,file,yyykc,samsmanager,wsproviders,yyykccachewarmup,ezperformancelogger,services,sysinfo"/>
+    <property name="project.configfilesuffix" value=".ini.append.php"/>
+
+  <!-- eZ standard stuff -->
+    <property name="project.legacydir" value="ezpublish_legacy/"/>
+    <property name="project.settingsoverridedir" value="${project.basedir}/${project.legacydir}settings/override"/>
+    <property name="project.autoloaddir" value="${project.basedir}/${project.legacydir}var/autoload" />
+
+  <!-- list of environments -->
+    <property name="project.production_identifier" value="prod" />
+    <property name="project.disaster_identifier" value="dr" />
+    <property name="project.development_identifier" value="dev" />
+    <property name="project.uat_identifier" value = "uat" />
+
+    <!-- will default to dev env if undetected when going through detect_env -->
+    <property name="project.env" value="" />
+
+    <!-- list of servers. Used within the detect_env task to find out the environment we are on.
+         Hostname should be as returned by 'hostname -f' -->
+    <property name="prod_host_web1" value="web1.sky.itm.kumina.net"/>
+    <property name="prod_host_web2" value="web2.sky.itm.kumina.net"/>
+    <property name="prod_host_bo1" value="bo1.sky.itm.kumina.net"/>
+    <property name="prod_host_bo2" value="bo2.sky.itm.kumina.net"/>
+    <property name="prod_host_file1" value="file1.sky.itm.kumina.net"/>
+    <property name="prod_host_file2" value="file2.sky.itm.kumina.net"/>
+
+    <property name="uat_host_web1" value="web1.sky-uat-dr.itm.kumina.net"/>
+    <property name="uat_host_web2" value="web2.sky-uat-dr.itm.kumina.net"/>
+    <property name="uat_host_bo1" value="bo1.sky-uat-dr.itm.kumina.net"/>
+    <property name="uat_host_bo2" value="bo2.sky-uat-dr.itm.kumina.net"/>
+    <property name="uat_host_file1" value="file1.sky-uat-dr.itm.kumina.net"/>
+    <property name="uat_host_file2" value="file2.sky-uat-dr.itm.kumina.net"/>
+
+    <!-- this file exists only on staging -->
+    <property name="stage_flag" value="/srv/www/.uat"/>
+
+    <!-- This file is used to place a server in mainentance mode and remove it from the loadbalancers -->
+    <property name="maintenance_file" value="/var/cache/yyy.ezpublish/ezpublish/maintenance.txt" />
+
+  <!-- Environment specific settings. Might be changed within the detect_env task -->
+    <!-- gg: cant we just use ${project.basedir} instead? -->
+    <property name="project.source_directory" value="/srv/www/www.yyykc.com" />
+    <property name="project.su" value="sudo -u www-data" />
+    <property name="project.user_group" value="www-data" />
+    <property name="project.ssh_group" value="${project.user_group}"/>
+    <!-- used by restore_solr task -->
+    <!-- gg: this also looks like a duplicate of ${project.basedir} -->
+    <property name="project.web_root" value="${project.source_directory}"/>
+    <property name="project.solr_url" value="" />
+    <property name="project.admin_url" value="" />
+    <property name="project.composer" value="${project.source_directory}/composer" />
+    <!-- arrays of serve hostnames, to execute tasks upon. Normally filled-in by detect_env -->
+    <property name="project.webservers" value=""/>
+    <property name="project.solrservers" value="aaa,bbb,dev.yyykc.local,ccc"/>
+    <property name="project.dbservers" value=""/>
+    <property name="project.workerservers" value=""/>
+
+    <property name="project.loadbalancer_timeout" value="15" />
+
+  <!-- unused -->
+    <!--<property name="project.processes" value="" />-->
+
+
+
+    <taskdef name="apache_block_comment" classname="ezpublish_legacy.extension.yyyvendors.classes.Phing.Task.ApacheBlockCommentTask"/>
+
+    <taskdef name="consolidate_test_autoloads" classname="ezpublish_legacy.extension.yyyvendors.classes.Phing.Task.ConsolidateTestAutoloadsTask" />
+
+    <taskdef name="check_solr_status" classname="ezpublish_legacy.extension.yyyvendors.classes.Phing.Task.CheckSolrStatusTask" />
+
+    <taskdef name="deploy_code" classname="ezpublish_legacy.extension.yyyvendors.classes.Phing.Task.DeployCodeTask" />
+
+    <taskdef name="replay_solr_actions" classname="ezpublish_legacy.extension.yyyvendors.classes.Phing.Task.ReplaySolrActionsTask" />
+
+    <taskdef name="delete_user_info_cache" classname="ezpublish_legacy.extension.yyyvendors.classes.Phing.Task.DeleteUserInfoCacheTask" />
+
+    <taskdef name="extend_conversion_timeout" classname="ezpublish_legacy.extension.yyyvendors.classes.Phing.Task.ExtendConversionTimeoutTask" />
+
+
+
+    <fileset id="cache_ini" dir="${project.legacydir}var/cache/ini">
+        <include name="**"/>
+    </fileset>
+
+    <fileset id="cache_templateblock" dir="${project.legacydir}var/${project.vardirname}/cache/template-block">
+        <include name="**"/>
+    </fileset>
+
+    <fileset id="cache_complete" dir="${project.legacydir}var">
+        <include name="cache/*.php"/>
+        <include name="cache/ini/**"/>
+        <include name="${project.vardirname}/cache/*.php"/>
+        <include name="${project.vardirname}/cache/codepages/**"/>
+        <include name="${project.vardirname}/cache/content/**"/>
+        <include name="${project.vardirname}/cache/override/**"/>
+        <include name="${project.vardirname}/cache/template/**"/>
+        <include name="${project.vardirname}/cache/public/**"/>
+        <include name="${project.vardirname}/cache/template-block/**"/>
+        <include name="${project.vardirname}/cache/trans/**"/>
+        <include name="${project.vardirname}/cache/translation/**"/>
+        <include name="${project.vardirname}/cache/user-info/**"/>
+        <include name="${project.vardirname}/cache/wildcard/**"/>
+        <include name="${project.vardirname}/cache/solr_convert/**"/>
+        <include name="${project.vardirname}/cache/sams/**"/>
+    </fileset>
+
+    <!-- we default to clearing sf caches for all envs -->
+    <fileset id="cache_symfony" dir="ezpublish/cache/">
+        <include name="**"/>
+    </fileset>
+
+    <fileset id="legacy_autoload_config" dir="${project.autoloaddir}">
+        <include name="**"/>
+    </fileset>
+
+
+
+    <target name="detect_user" description="Detects current user">
+        <if>
+            <os family="unix"/>
+            <then>
+                <property name="project.username" value="${env.USER}"/>
+            </then>
+            <elseif>
+                <os family="windows"/>
+                <then>
+                    <property name="project.username" value="${env.USERNAME}"/>
+                </then>
+            </elseif>
+        </if>
+
+        <if>
+            <isfalse value="${project.username}"/>
+            <then>
+                <property name="project.username" value="anonymous"/>
+            </then>
+        </if>
+
+        <echo msg="Detected user: ${project.username}"/>
+    </target>
+
+    <target name="detect_env" description="Detects Environment" depends="detect_user">
+
+        <exec command="hostname -f" outputProperty="project.host_identifier"/>
+
+        <!-- Production -->
+        <if>
+            <or>
+                <equals arg1="${project.host_identifier}" arg2="${prod_host_web1}"/>
+                <equals arg1="${project.host_identifier}" arg2="${prod_host_web2}"/>
+                <equals arg1="${project.host_identifier}" arg2="${prod_host_bo1}"/>
+                <equals arg1="${project.host_identifier}" arg2="${prod_host_bo2}"/>
+                <equals arg1="${project.host_identifier}" arg2="${prod_host_file1}"/>
+                <equals arg1="${project.host_identifier}" arg2="${prod_host_file2}"/>
+            </or>
+            <then>
+                <property name="project.env" value="${project.production_identifier}" override="true"/>
+                <property name="project.ssh_group" value="${project.user_group}" override="true"/>
+                <property name="project.web_root" value="${project.source_directory}" override="true"/>
+                <property name="project.solr_url" value="http://solr:8984/solr/" override="true"/>
+                <property name="project.admin_url" value="https://admin.yyykc.com/" override="true"/>
+                <property name="project.webservers" value="${prod_host_web1},${prod_host_web2},${prod_host_bo1},${prod_host_bo2},${prod_host_file1},${prod_host_file2}" override="true"/>
+                <property name="project.workers" value="${prod_host_file1},${prod_host_file2}" override="true"/>
+            </then>
+
+
+        <!-- Disaster Recovery -->
+        <elseif>
+            <or>
+                <equals arg1="${project.host_identifier}" arg2="${stage_dr_host_web1}"/>
+                <equals arg1="${project.host_identifier}" arg2="${stage_dr_host_web3}"/>
+            </or>
+            <then>
+                <property name="project.env" value="${project.disaster_identifier}" override="true"/>
+                <property name="project.ssh_group" value="${project.user_group}" override="true"/>
+                <property name="project.web_root" value="${project.source_directory}" override="true"/>
+                <property name="project.solr_url" value="http://stage-solr1.yyykc.com:8984/solr/" override="true"/>
+                <property name="project.admin_url" value="https://admin.yyykc.com" override="true"/>
+                <property name="project.webservers" value="${stage_dr_host_web1},${stage_dr_host_web3}" override="true"/>
+            </then>
+        </elseif>
+
+        <!-- UAT Environment -->
+        <elseif>
+            <or>
+                <equals arg1="${project.host_identifier}" arg2="${uat_host_web1}"/>
+                <equals arg1="${project.host_identifier}" arg2="${uat_host_web2}"/>
+                <equals arg1="${project.host_identifier}" arg2="${uat_host_bo1}"/>
+                <equals arg1="${project.host_identifier}" arg2="${uat_host_bo2}"/>
+                <equals arg1="${project.host_identifier}" arg2="${uat_host_file1}"/>
+                <equals arg1="${project.host_identifier}" arg2="${uat_host_file2}"/>
+            </or>
+            <then>
+                <property name="project.env" value="${project.uat_identifier}" override="true"/>
+                <property name="project.ssh_group" value="${project.user_group}" override="true"/>
+                <property name="project.web_root" value="${project.source_directory}" override="true"/>
+                <property name="project.solr_url" value="http://uat-solr:8984/solr/" override="true"/>
+                <property name="project.admin_url" value="https://uat-admin.yyykc.com/" override="true"/>
+                <property name="project.webservers" value="${uat_host_web1},${uat_host_web2},${uat_host_bo1},${uat_host_bo2},${uat_host_file1},${uat_host_file2}" override="true"/>
+                <property name="project.workers" value="${uat_host_file1},${uat_host_file2}" override="true"/>
+            </then>
+        </elseif>
+
+        <!-- Development -->
+        <else>
+            <property name="project.env" value="${project.development_identifier}" override="true"/>
+            <property name="project.web_root" value="/var/www/dev.yyykc.com" override="true"/>
+            <!-- gg: better to use yyykc.local:8983 ? -->
+            <property name="project.solr_url" value="http://localhost:8983/solr/" override="true"/>
+            <property name="project.admin_url" value="http://admin.yyykc.local/" override="true"/>
+            <property name="project.source_directory" value="~/yyykc" override="true"/>
+            <property name="project.configfiles" value="${project.configfiles},debug" override="true"/>
+            <property name="project.composer" value="/usr/local/bin/composer" override="true" />
+            <property name="maintenance_file" value="" override="true" />
+        </else>
+        </if>
+
+        <echo msg="Detected Environment: ${project.env}"/>
+    </target>
+
+    <!-- @todo this will fail in prod because of missing sudo calls -->
+    <target name="generate_autoloader" description="Generates eZ Publish autoloaders">
+        <echo msg="[DEPRECATED] Generating eZ Publish autoloaders..."/>
+        <if>
+            <available file="${project.autoloaddir}" type="dir" />
+            <then>
+                <echo msg="Clearing old autoloaders..."/>
+                <delete verbose="true" includeemptydirs="false" failonerror="false">
+                    <fileset refid="legacy_autoload_config"/>
+                </delete>
+            </then>
+            <else>
+                <mkdir dir="${project.autoloaddir}" mode="6775" />
+            </else>
+        </if>
+
+        <exec command="${php} bin/php/ezpgenerateautoloads.php -o" dir="ezpublish_legacy" checkreturn="true" logoutput="true"/>
+        <exec command="${php} bin/php/ezpgenerateautoloads.php -e" dir="ezpublish_legacy" checkreturn="true" logoutput="true"/>
+        <!-- gg: it seems that we are doing work twice ? -->
+        <exec command="${php} bin/php/ezpgenerateautoloads.php -e -o" dir="ezpublish_legacy" checkreturn="true" logoutput="true"/>
+        <exec command="${php} bin/php/ezpgenerateautoloads.php -s" dir="ezpublish_legacy" checkreturn="true" logoutput="true"/>
+        <consolidate_test_autoloads />
+    </target>
+
+    <!-- @todo add support for clearing single cache ids or tags -->
+    <target name="clear_legacy_cache_api" depends="detect_env" description="Calls eZ Publish 4 Clear-Cache scripts, on all webs. -Dpurge -Dexpiry">
+        <echo msg="Clearing eZ Publish Legacy cache using API..."/>
+        <!-- The Purge option deletes files from the FS, if the cache is programmed to use it -->
+        <if>
+            <not>
+                <isset property="purge" />
+            </not>
+            <then>
+                <property name="project.purge" value="" />
+                <property name="purge" value="0" override="true" />
+            </then>
+            <else>
+                <property name="project.purge" value="--purge" />
+            </else>
+        </if>
+        <!-- The Expiry option kills the cache from the DB, so it gets anything the purge might miss -->
+        <if>
+            <not>
+                <isset property="expiry" />
+            </not>
+            <then>
+                <property name="project.expiry" value="" />
+                <property name="expiry" value="0" override="true" />
+            </then>
+            <else>
+                <property name="project.expiry" value="--expiry=now" />
+            </else>
+        </if>
+        <exec command="${project.su} ${php} ${project.source_directory}/ezpublish/console --env=${project.env} ezpublish:legacy:script bin/php/ezcache.php --clear-all ${project.purge} ${project.expiry}" checkreturn="true" logoutput="true"/>
+
+        <if>
+            <not>
+                <isset property="noremote" />
+            </not>
+            <then>
+                <phingcall target="-run_phing_target_on_all_webs">
+                    <property name="target_name" value="clear_legacy_cache_api" />
+                    <property name="param" value="purge=${purge}" />
+                    <property name="param" value="purge=${expiry}" />
+                </phingcall>
+                <phingcall target="-run_phing_target_on_all_workers">
+                    <property name="target_name" value="clear_legacy_cache_api" />
+                    <property name="param" value="purge=${purge}" />
+                    <property name="param" value="purge=${expiry}" />
+                </phingcall>
+            </then>
+        </if>
+    </target>
+
+    <target name="clear_cache_api" depends="detect_env" description="Clears the Symfony and Legacy caches using correct user permissions">
+        <echo msg="Clearing Symfony and Legacy caches..." />
+
+        <!-- remove server from load balancer -->
+        <phingcall target="-remove_from_loadbalancer" />
+
+        <exec command="${project.su} ${php} ${project.source_directory}/ezpublish/console cache:clear --env=${project.env}" checkreturn="true" logoutput="true" />
+
+        <!-- Reload apache on the current web server -->
+        <phingcall target="reload_apache">
+            <property name="noremote" value="true" />
+        </phingcall>
+
+        <!-- Restart workers if they exist -->
+        <phingcall target="rabbit_killer">
+            <property name="noremote" value="true" />
+        </phingcall>
+
+        <!-- add server back into loadbalancers-->
+        <phingcall target="-add_to_loadbalancer" />
+
+        <if>
+            <not>
+                <isset property="noremote" />
+            </not>
+            <then>
+                <phingcall target="-run_phing_target_on_all_webs">
+                    <property name="target_name" value="clear_cache_api" />
+                </phingcall>
+                <phingcall target="-run_phing_target_on_all_workers">
+                    <property name="target_name" value="clear_cache_api" />
+                </phingcall>
+            </then>
+        </if>
+    </target>
+
+    <target name="clear_cache_filedelete_symfony" depends="detect_env" description="Clears eZ Publish 5 cache (SF only) on all servers">
+        <echo msg="Clearing eZ Publish SF cache (deleting files)..."/>
+
+        <!-- remove server from load balancer -->
+        <phingcall target="-remove_from_loadbalancer" />
+
+        <delete verbose="true" includeemptydirs="true" failonerror="false">
+            <fileset refid="cache_symfony" />
+        </delete>
+
+        <!-- Reload apache on the current web server -->
+        <phingcall target="reload_apache">
+            <property name="noremote" value="true" />
+        </phingcall>
+
+        <!-- Restart workers if they exist -->
+        <phingcall target="rabbit_killer">
+            <property name="noremote" value="true" />
+        </phingcall>
+
+        <!-- add server back into loadbalancers-->
+        <phingcall target="-add_to_loadbalancer" />
+
+        <if>
+            <not>
+                <isset property="noremote" />
+            </not>
+            <then>
+                <phingcall target="-run_phing_target_on_all_webs">
+                    <property name="target_name" value="clear_cache_filedelete_symfony"/>
+                </phingcall>
+                <phingcall target="-run_phing_target_on_all_workers">
+                    <property name="target_name" value="clear_cache_filedelete_symfony" />
+                </phingcall>
+            </then>
+        </if>
+    </target>
+
+    <!-- @deprecated using API calls should finally work for all caches -->
+    <target name="clear_cache_filedelete_ini" depends="detect_env" description="Clears eZ Publish INI cache on all servers">
+        <echo msg="Clearing eZ Publish INI cache (deleting files)..."/>
+
+        <!-- remove server from load balancer -->
+        <phingcall target="-remove_from_loadbalancer" />
+
+        <delete verbose="true" includeemptydirs="true" failonerror="false">
+            <fileset refid="cache_ini"/>
+        </delete>
+
+        <!-- Reload apache on the current web server -->
+        <phingcall target="reload_apache">
+            <property name="noremote" value="true" />
+        </phingcall>
+
+        <!-- Restart workers if they exist -->
+        <phingcall target="rabbit_killer">
+            <property name="noremote" value="true" />
+        </phingcall>
+
+        <!-- add server back into loadbalancers-->
+        <phingcall target="-add_to_loadbalancer" />
+
+        <if>
+            <not>
+                <isset property="noremote" />
+            </not>
+            <then>
+                <phingcall target="-run_phing_target_on_all_webs">
+                    <property name="target_name" value="clear_cache_filedelete_ini"/>
+                </phingcall>
+                <phingcall target="-run_phing_target_on_all_workers">
+                    <property name="target_name" value="clear_cache_filedelete_ini" />
+                </phingcall>
+            </then>
+        </if>
+    </target>
+
+    <!-- @deprecated using API calls should finally work for all caches -->
+    <target name="clear_cache_filedelete_templateblock" depends="detect_env" description="Clears eZ Publish template block cache on all servers">
+        <echo msg="Clearing eZ Publish template-block cache (deleting files)..."/>
+
+        <!-- remove server from load balancer -->
+        <phingcall target="-remove_from_loadbalancer" />
+
+        <delete verbose="true" includeemptydirs="true" failonerror="false">
+            <fileset refid="cache_templateblock"/>
+        </delete>
+
+        <!-- Reload apache on the current web server -->
+        <phingcall target="reload_apache">
+            <property name="noremote" value="true" />
+        </phingcall>
+
+        <!-- Restart workers if they exist -->
+        <phingcall target="rabbit_killer">
+            <property name="noremote" value="true" />
+        </phingcall>
+
+        <!-- add server back into loadbalancers-->
+        <phingcall target="-add_to_loadbalancer" />
+
+        <if>
+            <not>
+                <isset property="noremote" />
+            </not>
+            <then>
+                <phingcall target="-run_phing_target_on_all_webs">
+                    <property name="target_name" value="clear_cache_filedelete_templateblock"/>
+                </phingcall>
+                <phingcall target="-run_phing_target_on_all_workers">
+                    <property name="target_name" value="clear_cache_filedelete_templateblock" />
+                </phingcall>
+            </then>
+        </if>
+    </target>
+
+    <!-- Run phing target remotely on all web servers (only usable as subtask) -->
+    <target name="-run_phing_target_on_all_webs">
+        <property name="loop_target" value="${target_name}" override="true"/>
+        <foreach list="${project.webservers}" param="host" target="-run_phing_target_on_remote_host" />
+    </target>
+
+    <!-- Run phing target remotely on all solr servers (only usable as subtask) -->
+    <target name="-run_phing_target_on_all_solrs">
+        <property name="loop_target" value="${target_name}" override="true"/>
+        <foreach list="${project.solrservers}" param="host" target="-run_phing_target_on_remote_host" />
+    </target>
+
+    <!-- Run phing target remotely on all db servers (only usable as subtask) -->
+    <target name="-run_phing_target_on_all_dbs">
+        <property name="loop_target" value="${target_name}" override="true"/>
+        <foreach list="${project.dbservers}" param="host" target="-run_phing_target_on_remote_host" />
+    </target>
+
+    <!-- Run phing target remotely on all worker servers (only usable as subtask) -->
+    <target name="-run_phing_target_on_all_workers">
+        <property name="loop_target" value="${target_name}" override="true"/>
+        <foreach list="${project.workerservers}" param="host" target="-run_phing_target_on_remote_host" />
+    </target>
+
+    <!-- Run phing target on a remote server (only usable as subtask) -->
+    <!-- properties which need to be set for this task: host, loop_target, and optionally param. Go global variables! -->
+    <!-- NB to avoid annoying recursive usage of detect_env via phing_call, we do not put it here as dependency, and check for empty env instead -->
+    <target name="-run_phing_target_on_remote_host">
+        <if>
+            <!-- note: empty var not an error -->
+            <equals arg1="" arg2="${project.env}"/>
+            <then>
+                <echo msg="Can not execute remote tasks, environment not detected" level="error" />
+            </then>
+            <else>
+                <if>
+                    <or>
+                        <!-- belt and suspenders: we check for noremote here even though the best way is not to call this task when that is set -->
+                        <contains string="${loop_target}" substring="run_phing_target_on_"/>
+                        <isset property="noremote" />
+                    </or>
+                    <then>
+                        <echo msg="Can not execute recursive remote tasks" level="error" />
+                    </then>
+                    <else>
+
+                        <if>
+                            <isset property="param" />
+                            <then>
+                                <property name="target" value="phing ${loop_target} -D${param} -Dnoremote" />
+                            </then>
+                            <else>
+                                <property name="target" value="phing ${loop_target} -Dnoremote" />
+                            </else>
+                        </if>
+
+                        <property name="tmp.ssh_command" value="sg ${project.ssh_group} \&quot;cd ${project.basedir} &amp;&amp; ${target}\&quot;"/>
+
+                        <if>
+                            <not>
+                                <equals arg1="${project.host_identifier}" arg2="${host}"/>
+                            </not>
+                            <then>
+                                <!--<echo msg="Running: ssh ${host} &quot;${tmp.ssh_command}&quot;"/>-->
+                                <echo message="Connecting to: ${host}" />
+                                <exec command="ssh ${host} &quot;${tmp.ssh_command}&quot;" logoutput="true"/>
+                            </then>
+                        </if>
+
+                    </else>
+                </if>
+            </else>
+        </if>
+    </target>
+
+    <target name="copy_configs" description="Copies proper config files for the current environment" depends="detect_env">
+        <!-- loop through list of file names defined above -->
+        <foreach list="${project.configfiles}" param="filename" target="-copy_config_file"/>
+
+        <if>
+            <equals arg1="${project.env}" arg2="${project.development_identifier}"/>
+            <then>
+                <!-- Comments lines like #__ASSETIC_BEGIN_ from htaccess -->
+                <phingcall target="enable_assetic_devmode_rewrites"/>
+            </then>
+            <else>
+                <phingcall target="disable_assetic_devmode_rewrites"/>
+            </else>
+        </if>
+
+        <if>
+            <or>
+                <equals arg1="${project.env}" arg2="${project.production_identifier}"/>
+                <equals arg1="${project.env}" arg2="${project.disaster_identifier}"/>
+                <equals arg1="${project.env}" arg2="${project.uat_identifier}"/>
+            </or>
+            <then>
+                <copy file="${project.basedir}/data/yyykc/env/${project.env}/config.cluster.php" todir="${project.basedir}/ezpublish_legacy" overwrite="true"/>
+                <!-- Uncomments lines like #__EZDFS_BEGIN__ from htaccess -->
+                <phingcall target="enable_ezdfs_rewrites"/>
+            </then>
+        </if>
+    </target>
+
+    <target name="-copy_config_file">
+        <if>
+            <available file="${project.basedir}/data/yyykc/env/${project.env}/settings/${filename}${project.configfilesuffix}" />
+            <then>
+                <echo msg="Copying environment config ${filename}..."/>
+
+                <!-- Backup up existing setting file if exists -->
+                <if>
+                    <available file="${project.settingsoverridedir}/${filename}${project.configfilesuffix}" />
+                    <then>
+                        <copy file="${project.settingsoverridedir}/${filename}${project.configfilesuffix}" tofile="${project.settingsoverridedir}/${filename}${project.configfilesuffix}.bak" haltonerror="false" overwrite="true"/>
+                    </then>
+                </if>
+
+                <!-- Copy the new config file if it exists -->
+                <copy file="${project.basedir}/data/yyykc/env/${project.env}/settings/${filename}${project.configfilesuffix}" todir="${project.settingsoverridedir}" overwrite="true"/>
+            </then>
+        </if>
+    </target>
+
+    <target name="check_templates" description="Checks templates for errors">
+        <echo msg="Checking templates for errors" />
+        <exec command="${project.su} ${php} ${project.source_directory}/ezpublish/console ezpublish:legacy:script bin/php/eztemplatecheck.php extension | grep &quot;file invalid&quot;" logoutput="true"/>
+    </target>
+
+    <target name="disable_cronjobs" description="Disables eZ Publish cron jobs">
+        <if>
+            <not>
+                <available file="runcronjobs.php_" filepath="ezpublish_legacy"/>
+            </not>
+            <then>
+                <echo msg="Disabling eZ Publish cron jobs..." />
+                <move file="${project.legacydir}runcronjobs.php" tofile="${project.legacydir}runcronjobs.php_"/>
+                <touch file="${project.legacydir}runcronjobs.php"/>
+            </then>
+            <else>
+                <echo msg="Can not disable cronjobs, doing nothing: previous backup found" level="error" />
+            </else>
+        </if>
+    </target>
+
+    <target name="enable_cronjobs" description="Enables eZ Publish cron jobs">
+        <if>
+            <available file="runcronjobs.php_" filepath="ezpublish_legacy"/>
+            <then>
+                <echo msg="Enabling eZ Publish cron jobs..." />
+                <delete file="${project.legacydir}runcronjobs.php"/>
+                <move file="${project.legacydir}runcronjobs.php_" tofile="${project.legacydir}runcronjobs.php"/>
+            </then>
+            <else>
+                <echo msg="Can not restore previous cronjobs, doing nothing" level="error" />
+            </else>
+        </if>
+    </target>
+
+    <target name="kill_process" description="Terminates a running process owned by www-data (will not work on dev)" depends="detect_env">
+        <property name="force_flag" value="" />
+        <if>
+            <isset property="force" />
+            <then>
+                <property name="force_flag" value="-f" override="true" />
+            </then>
+        </if>
+
+        <if>
+            <not>
+                <isset property="pid" />
+            </not>
+            <then>
+                <echo msg="Error: You must specify a PID" />
+            </then>
+            <elseif>
+                <equals arg1="${project.env}" arg2="${project.development_identifier}" />
+                <then>
+                    <echo msg="Error: This command will not work locally.  You must invoke the command directly (see yyy:kill_process)" />
+                </then>
+            </elseif>
+            <else>
+                <exec command="${project.su} ${php} ${project.source_directory}/ezpublish/console --env=${project.env} yyy:kill_process ${pid} ${force_flag}" checkreturn="true" logoutput="true"/>
+            </else>
+        </if>
+    </target>
+
+    <target name="solr_status" description="Checks status of solr" depends="detect_env">
+        <if>
+            <not>
+                <equals arg1="${project.solr_url}" arg2="" />
+            </not>
+            <then>
+                <echo msg="Checking Solr Status..."/>
+                <check_solr_status solrurl="${project.solr_url}"/>
+            </then>
+        </if>
+    </target>
+
+    <target name="restore_solr" depends="detect_env" description="Performs actions necessary for bringing Solr out of failover mode">
+        <check_solr_status solrurl="${project.solr_url}" />
+
+        <if>
+            <equals arg1="${project.solr_status}" arg2="1" />
+            <then>
+                <echo msg="Solr is not in failover.  Nothing to do" />
+            </then>
+            <elseif>
+                <equals arg1="${project.solr_status}" arg2="-1" />
+                <then>
+                    <echo msg="Error: Cannot confirm the status of solr, please check manually" />
+                </then>
+            </elseif>
+            <else>
+                <echo msg="Preparing to restore Solr from failover..>" />
+                <phingcall target="disable_cronjobs" />
+
+                <replay_solr_actions webroot="${project.web_root}" solrurl="${project.solr_url}" />
+
+                <phingcall target="enable_cronjobs" />
+            </else>
+        </if>
+    </target>
+
+    <target name="enable_ezdfs_rewrites" description="Enables eZDFS rewrites in .htaccess">
+        <apache_block_comment enabled="true" signatureBegin="#__EZDFS_BEGIN__" signatureEnd="#__EZDFS_END__" baseDir="web" />
+    </target>
+
+    <target name="disable_ezdfs_rewrites" description="Disables eZDFS rewrites in .htaccess">
+        <apache_block_comment enabled="false" signatureBegin="#__EZDFS_BEGIN__" signatureEnd="#__EZDFS_END__" baseDir="web" />
+    </target>
+
+    <target name="enable_assetic_devmode_rewrites" description="Enables assetic dev-mode rewrites in .htaccess">
+        <apache_block_comment enabled="false" signatureBegin="#__ASSETIC_BEGIN__" signatureEnd="#__ASSETIC_END__" baseDir="web" />
+    </target>
+
+    <target name="disable_assetic_devmode_rewrites" description="Disables assetic dev-mode rewrites in .htaccess">
+        <apache_block_comment enabled="true" signatureBegin="#__ASSETIC_BEGIN__" signatureEnd="#__ASSETIC_END__" baseDir="web" />
+    </target>
+
+    <target name="disable_pt" description="Disables access to PT in .htaccess" depends="detect_env">
+        <if>
+            <not>
+                <equals arg1="${project.env}" arg2="${project.production_identifier}" />
+            </not>
+            <then>
+                <echo message="This target will only work on Production" level="error" />
+            </then>
+            <else>
+                <apache_block_comment enabled="true" signatureBegin="#__PT_MAINTENANCE_BEGIN__" signatureEnd="#__PT_MAINTENANCE_END__" baseDir="web" />
+            </else>
+        </if>
+    </target>
+
+    <target name="enable_pt" description="Enables access to PT in .htaccess" depends="detect_env">
+        <if>
+            <not>
+                <equals arg1="${project.env}" arg2="${project.production_identifier}" />
+            </not>
+            <then>
+                <echo message="This target will only work on Production" level="error" />
+            </then>
+            <else>
+                <apache_block_comment enabled="false" signatureBegin="#__PT_MAINTENANCE_BEGIN__" signatureEnd="#__PT_MAINTENANCE_END__" baseDir="web" />
+            </else>
+        </if>
+    </target>
+
+    <target name="update_assets" depends="detect_env" description="Updates all assets on all webservers">
+        <!-- Create symlinks -->
+        <!-- Note: These should not be run as www-data, as Kumina does not like www-data to have write access to application files -->
+        <exec command="${php} ${project.source_directory}/ezpublish/console --env=${project.env} assets:install --symlink web" checkreturn="true" logoutput="true"/>
+        <exec command="${php} ${project.source_directory}/ezpublish/console --env=${project.env} ezpublish:legacy:assets_install --symlink web" checkreturn="true" logoutput="true"/>
+
+        <!-- Dump assetics -->
+        <!-- Note: This should not be run as www-data, as Kumina does not like www-data to have write access to application files -->
+        <exec command="${php} ${project.source_directory}/ezpublish/console assetic:dump --env=${project.env} web" checkreturn="true" logoutput="true" />
+
+        <phingcall target="-run_phing_target_on_all_webs">
+            <property name="target_name" value="update_assets" />
+        </phingcall>
+    </target>
+
+    <target name="update_env" depends="detect_env,copy_configs" description="Updates Environment">
+        <!-- Set local variables based on environment -->
+        <property name="dev_flag" value="--no-dev" />
+        <property name="index" value="index_${project.env}\\\.php" />
+
+        <if>
+            <equals arg1="${project.env}" arg2="${project.development_identifier}" />
+            <then>
+                <property name="dev_flag" value="--dev" override="true"/>
+            </then>
+        </if>
+
+        <!-- Install Vendor bundles -->
+        <exec command="${project.composer} install ${dev_flag} --no-scripts" checkreturn="true" logoutput="true" />
+
+        <phingcall target="clear_cache_filedelete_ini" />
+
+        <phingcall target="update_assets" />
+
+        <!-- Update the .htaccess file to point to the correct index file -->
+        <exec command="sed -i 's/RewriteRule \.\* index[^\.]*\\\.php/RewriteRule \.\* ${index}/' .htaccess" dir="web" checkreturn="true" logoutput="true" />
+
+        <!-- Ensure unoconv is executable -->
+        <phingcall target="enable_unoconv_executable" />
+
+        <!-- Copy config file for unit testing if on dev -->
+        <if>
+            <equals arg1="${project.env}" arg2="${project.development_identifier}" />
+            <then>
+                <exec command="cp vendor/ezsystems/ezpublish-kernel/config.php-DEVELOPMENT vendor/ezsystems/ezpublish-kernel/config.php" checkreturn="true" logoutput="true" />
+            </then>
+        </if>
+    </target>
+
+    <target name="reload_apache" depends="detect_env" description="Reloads Apache on all web servers">
+        <if>
+            <available file="/etc/init.d/apache2" />
+            <then>
+                <echo msg="Reloading Apache..."/>
+                <exec command="sudo /etc/init.d/apache2 reload" checkreturn="true" logoutput="true"/>
+            </then>
+            <else>
+                <echo msg="Apache not found.  Skipping reload..." />
+            </else>
+        </if>
+
+        <!-- Don't recurse if not required -->
+        <if>
+            <not>
+                <isset property="noremote" />
+            </not>
+            <then>
+                <phingcall target="-run_phing_target_on_all_webs">
+                    <property name="target_name" value="reload_apache"/>
+                </phingcall>
+            </then>
+        </if>
+    </target>
+
+    <target name="restart_apache" depends="detect_env" description="Restarts Apache on all web servers">
+        <echo msg="Restaring Apache..."/>
+        <exec command="sudo /etc/init.d/apache2 restart" checkreturn="true" logoutput="true"/>
+
+        <!-- Don't recurse if not required -->
+        <if>
+            <not>
+                <isset property="noremote" />
+            </not>
+            <then>
+                <phingcall target="-run_phing_target_on_all_webs">
+                    <property name="target_name" value="restart_apache"/>
+                </phingcall>
+            </then>
+        </if>
+    </target>
+
+    <target name="clear_alerts_searches" description="Removes research alerts and saved searches from the database (should run on dev environment only!)" depends="detect_env">
+        <if>
+            <or>
+                <equals arg1="${project.env}" arg2="${project.development_identifier}"/>
+                <equals arg1="${project.env}" arg2="${project.uat_identifier}" />
+            </or>
+            <then>
+                <exec command="${project.su} ${php} ${project.source_directory}/ezpublish/console --env=${project.env} yyy:saved_searches_alerts:delete" checkreturn="true" passthru="true" />
+            </then>
+            <else>
+                <echo msg="This target must not be executed on production!" level="error" />
+            </else>
+        </if>
+    </target>
+
+    <!-- @todo before deploy stop cronjobs, as we do not want the watchdog running, then kill workers. After deploy, restart them -->
+    <target name="deploy" description="Performs a code deploy to the server, and clears caches depending on changes" depends="detect_env">
+        <echo msg="Deploying updates..." />
+        <if>
+            <not>
+                <isset property="force" />
+            </not>
+            <then><property name="force" value="0" /></then>
+        </if>
+
+        <if>
+            <not>
+                <isset property="branch" />
+            </not>
+            <then><property name="branch" value="master" /></then>
+        </if>
+
+        <echo msg="Using branch: ${branch}" />
+        <property name="clear_ini" value="0" />
+        <property name="clear_override" value="0" />
+        <property name="copy_ini" value="0" />
+        <property name="status" value="0" />
+
+        <deploy_code force="${force}" branch="${branch}" env="${project.env}" />
+
+        <if>
+            <equals arg1="${status}" arg2="1" />
+            <then>
+                <if>
+                    <equals arg1="${copy_ini}" arg2="1" />
+                    <then>
+                        <phingcall target="copy_configs" />
+                    </then>
+                </if>
+
+                <if>
+                    <equals arg1="${clear_ini}" arg2="1" />
+                    <then>
+                        <phingcall target="clear_cache_filedelete_ini" />
+                    </then>
+                </if>
+
+                <phingcall target="clear_cache_api" />
+                <phingcall target="enable_unoconv_executable" />
+            </then>
+        </if>
+    </target>
+
+    <target name="rabbit_killer" depends="detect_env" description="Kills the RabbitMQ workers. Cron will normally restart them afterwards">
+        <exec command="${project.su} ${php} ${project.source_directory}/ezpublish/console --env=${project.env} yyy:queueing:workerswatchdog stop" checkreturn="true" logoutput="true"/>
+
+        <!-- Don't recurse if required -->
+        <if>
+            <not>
+                <isset property="noremote" />
+            </not>
+            <then>
+                <phingcall target="-run_phing_target_on_all_webs">
+                    <property name="target_name" value="rabbit_killer" />
+                </phingcall>
+            </then>
+        </if>
+    </target>
+
+    <target name="help" description="Displays Help message">
+        <exec command="phing -l" logoutput="true"/>
+    </target>
+
+    <target name="enable_unoconv_executable" depends="detect_env" description="Sets the executable bit on the unoconv script">
+        <exec command="chmod +x ${project.source_directory}/${project.legacydir}extension/yyyconversion/bin/debian/usr/local/sbin/unoconv" checkreturn="true" logoutput="true" />
+    </target>
+
+    <target name="extend_conversion" description="Extends the unoconv conversion timeout by specified factor (default x2)" depends="detect_env">
+        <if>
+            <not>
+                <isset property="factor" />
+            </not>
+            <then>
+                <property name="factor" value="2" />
+            </then>
+        </if>
+
+        <property name="basedir" value="${project.basedir}/${project.legacydir}extension/yyyconversion/settings" />
+        <property name="conversionfile" value="${basedir}/conversion.ini" />
+        <if>
+            <available file="conversion.ini.bak" filepath="${basedir}" />
+            <then>
+                <echo msg="The conversion timeout has already been modified." level="error" />
+            </then>
+            <else>
+                <echo msg="Creating backup of conversion settings..." />
+                <extend_conversion_timeout factor="${factor}" source="${conversionfile}" />
+
+                <phingcall target="clear_cache_filedelete_ini" />
+            </else>
+        </if>
+
+    </target>
+
+    <target name="restore_conversion" description="Restores the unoconv conversion timeout to the default value" depends="detect_env">
+        <property name="basedir" value="${project.basedir}/${project.legacydir}extension/yyyconversion/settings" />
+        <property name="conversionfile" value="${basedir}/conversion.ini" />
+
+        <if>
+            <available file="conversion.ini.bak" filepath="${basedir}" />
+            <then>
+                <echo msg="Restoring original conversion settings..." />
+                <move file="${conversionfile}.bak" tofile="${conversionfile}" overwrite="true"/>
+                <phingcall target="clear_cache_filedelete_ini" />
+            </then>
+        </if>
+    </target>
+
+    <!-- Subtarget for removing server from loadbalancer rotation -->
+    <target name="-remove_from_loadbalancer">
+        <if>
+            <not>
+                <equals arg1="" arg2="${maintenance_file}" />
+            </not>
+            <then>
+                <touch file="${maintenance_file}" />
+                <echo message="Sleeping ${project.loadbalancer_timeout} seconds to wait for loadbalancer" />
+                <exec command="sleep ${project.loadbalancer_timeout}" />
+            </then>
+        </if>
+    </target>
+
+    <!-- Subtarget for adding a server back into the loadbalancer rotation -->
+    <target name="-add_to_loadbalancer">
+        <if>
+            <and>
+                <not>
+                    <equals arg1="" arg2="${maintenance_file}" />
+                </not>
+                <available file="${maintenance_file}" />
+            </and>
+            <then>
+                <delete file="${maintenance_file}" quiet="true" />
+                <echo message="Sleeping ${project.loadbalancer_timeout} seconds to wait for loadbalancer" />
+                <exec command="sleep ${project.loadbalancer_timeout}" />
+            </then>
+        </if>
+    </target>
+</project>
